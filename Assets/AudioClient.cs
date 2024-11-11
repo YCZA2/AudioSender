@@ -1,4 +1,5 @@
 using System;
+using System.Collections;
 using System.Net.Sockets;
 using System.Threading;
 using System.Collections.Concurrent;
@@ -8,41 +9,47 @@ using UnityEngine.UI;
 
 public class AudioClient : MonoBehaviour
 {
-    [Header("UI References")]
-    [SerializeField] private TMP_InputField ipInputField;
+    [Header("UI References")] [SerializeField]
+    private TMP_InputField ipInputField;
+
     [SerializeField] private TMP_InputField portInputField;
     [SerializeField] private Button connectButton;
     [SerializeField] private Button stopButton;
     [SerializeField] private TextMeshProUGUI log;
-    
-    [Header("Audio Settings")]
-    [SerializeField] private int sampleRate = 44100;
+
+    [Header("Audio Settings")] [SerializeField]
+    private int sampleRate = 44100;
+
     [SerializeField] private int channels = 1;
     [SerializeField] private int recordingLength = 10;
     [SerializeField] private int sendIntervalMs = 1000;
     [SerializeField] private int bufferSize = 4096;
     [SerializeField] private AudioSource audioSource;
-    
+
     [Header("Compression Settings")]
     // [SerializeField] private bool enableCompression = true;
     // [SerializeField] private bool enableValidation = true;
-
     private TcpClient client;
+
     private NetworkStream stream;
+
     private volatile bool isRunning;
-    private Thread sendThread;
-    private Thread receiveThread;
+
+    // private Thread sendThread;
+    // private Thread receiveThread;
+    private Coroutine sendCoroutine;
+    private Coroutine receiveCoroutine;
     private AudioClip recordingClip;
     private AudioClip playbackClip;
     private readonly object lockObject = new();
-    private ConcurrentQueue<float[]> audioDataQueue = new();    // ConcurrentQueue是线程安全的
-    private const int MAX_QUEUE_SIZE = 100;  // 限制队列大小以防内存溢出
-    
+    private ConcurrentQueue<float[]> audioDataQueue = new(); // ConcurrentQueue是线程安全的
+    private const int MAX_QUEUE_SIZE = 100; // 限制队列大小以防内存溢出
+
     private int lastRecordPosition;
     private float[] fadeBuffer;
     private const float FADE_DURATION = 0.1f; // 100ms淡入淡出
     private bool isDisposed;
-    
+
     private SynchronizationContext mainThread;
 
     private void Start()
@@ -59,6 +66,7 @@ public class AudioClient : MonoBehaviour
         {
             audioSource = gameObject.AddComponent<AudioSource>();
         }
+
         audioSource.playOnAwake = false;
         audioSource.spatialBlend = 0; // 2D音频
         audioSource.loop = true;
@@ -77,36 +85,31 @@ public class AudioClient : MonoBehaviour
     {
         try
         {
-            if (!isRunning) return; // 防止重复调用
-
-            // 1. 停止所有操作
             isRunning = false;
-            
-            // 2. 停止录音
+
             if (Microphone.IsRecording(null))
             {
                 Microphone.End(null);
             }
-            
-            // 3. 停止音频播放
+
             if (audioSource != null && audioSource.isPlaying)
             {
                 audioSource.Stop();
             }
-            
-            // 4. 等待线程安全终止
-            WaitForThreadsToEnd();
-            
-            // 5. 关闭网络连接
+
+            // 停止协程
+            if (sendCoroutine != null)
+                StopCoroutine(sendCoroutine);
+            if (receiveCoroutine != null)
+                StopCoroutine(receiveCoroutine);
+
             CloseConnection();
-            
-            // 6. 更新UI状态
+
             stopButton.interactable = false;
             connectButton.interactable = true;
-            
-            // 7. 清理音频资源
+
             CleanupAudioResources();
-            
+
             UpdateLog("Session stopped successfully.");
         }
         catch (Exception ex)
@@ -115,34 +118,7 @@ public class AudioClient : MonoBehaviour
             UpdateLog("Error occurred while stopping session.");
         }
     }
-    
-    private void WaitForThreadsToEnd()
-    {
-        try
-        {
-            // 给予线程一个合理的时间来完成当前操作
-            if (sendThread != null && sendThread.IsAlive)
-            {
-                if (!sendThread.Join(TimeSpan.FromSeconds(2)))
-                {
-                    Debug.LogWarning("Send thread did not terminate gracefully");
-                }
-            }
 
-            if (receiveThread != null && receiveThread.IsAlive)
-            {
-                if (!receiveThread.Join(TimeSpan.FromSeconds(2)))
-                {
-                    Debug.LogWarning("Receive thread did not terminate gracefully");
-                }
-            }
-        }
-        catch (ThreadStateException ex)
-        {
-            Debug.LogError($"Error waiting for threads to end: {ex}");
-        }
-    }
-    
     private void CloseConnection()
     {
         lock (lockObject)
@@ -151,7 +127,7 @@ public class AudioClient : MonoBehaviour
             {
                 NetworkStream currentStream = stream;
                 TcpClient currentClient = client;
-                
+
                 stream = null;
                 client = null;
 
@@ -163,7 +139,7 @@ public class AudioClient : MonoBehaviour
                 {
                     Debug.LogWarning($"Error flushing stream: {ex.Message}");
                 }
-                
+
                 try
                 {
                     currentStream?.Close();
@@ -180,6 +156,7 @@ public class AudioClient : MonoBehaviour
                     {
                         currentClient.Close();
                     }
+
                     currentClient?.Dispose();
                 }
                 catch (Exception ex)
@@ -187,7 +164,9 @@ public class AudioClient : MonoBehaviour
                     Debug.LogWarning($"Error closing client: {ex.Message}");
                 }
 
-                while (audioDataQueue.TryDequeue(out _)) { }
+                while (audioDataQueue.TryDequeue(out _))
+                {
+                }
             }
             finally
             {
@@ -196,7 +175,7 @@ public class AudioClient : MonoBehaviour
             }
         }
     }
-    
+
     private void CleanupAudioResources()
     {
         // 清理AudioClip资源
@@ -249,12 +228,12 @@ public class AudioClient : MonoBehaviour
             client = new TcpClient();
             var result = client.BeginConnect(ip, port, null, null);
             var success = result.AsyncWaitHandle.WaitOne(TimeSpan.FromSeconds(5));
-            
+
             if (!success)
             {
                 throw new Exception("Connection attempt timed out.");
             }
-            
+
             // 连接成功，获取网络流
             client.EndConnect(result);
             stream = client.GetStream();
@@ -274,27 +253,21 @@ public class AudioClient : MonoBehaviour
     /// </summary>
     private void StartSession()
     {
-        // 检查麦克风是否可用
         if (!Microphone.devices.Length.Equals(0))
         {
             isRunning = true;
             audioDataQueue = new ConcurrentQueue<float[]>();
-            
-            // 启动录音
+
             recordingClip = Microphone.Start(null, true, recordingLength, sampleRate);
-            
-            // 创建播放用的AudioClip
+
             playbackClip = AudioClip.Create("PlaybackClip", bufferSize, channels, sampleRate, true, OnAudioRead);
             audioSource.clip = playbackClip;
             audioSource.Play();
 
-            // 启动发送和接收线程
-            sendThread = new Thread(SendAudioData) { IsBackground = true };
-            receiveThread = new Thread(ReceiveAudioData) { IsBackground = true };
-            
-            sendThread.Start();
-            receiveThread.Start();
-            
+            // 启动协程而不是线程
+            sendCoroutine = StartCoroutine(SendAudioDataCoroutine());
+            receiveCoroutine = StartCoroutine(ReceiveAudioDataCoroutine());
+
             UpdateLog("Session started... Press Stop to end.");
         }
         else
@@ -305,11 +278,12 @@ public class AudioClient : MonoBehaviour
     }
 
     // 发送音频数据
-    private void SendAudioData()
+    private IEnumerator SendAudioDataCoroutine()
     {
         int samplesPerFrame = sampleRate * sendIntervalMs / 1000;
         float[] samples = new float[samplesPerFrame * channels];
-        
+        WaitForSeconds wait = new WaitForSeconds(sendIntervalMs / 1000f);
+
         while (isRunning && client?.Connected == true)
         {
             try
@@ -320,44 +294,45 @@ public class AudioClient : MonoBehaviour
                     if (currentPosition < 0 || recordingClip == null) continue;
 
                     int readPosition = lastRecordPosition;
-                    int samplesToRead = (currentPosition - lastRecordPosition + recordingClip.samples) 
+                    int samplesToRead = (currentPosition - lastRecordPosition + recordingClip.samples)
                                         % recordingClip.samples;
 
-                    // 循环处理所有可用数据
                     while (samplesToRead >= samples.Length && isRunning)
                     {
                         recordingClip.GetData(samples, readPosition);
                         byte[] bytes = ConvertFloatToByte(samples);
-                        
+
                         if (stream != null)
                         {
                             stream.Write(bytes, 0, bytes.Length);
-                            stream.Flush(); // 确保数据立即发送
+                            stream.Flush();
                         }
-                        
+
                         readPosition = (readPosition + samples.Length) % recordingClip.samples;
                         samplesToRead -= samples.Length;
                         lastRecordPosition = readPosition;
                     }
                 }
-                Thread.Sleep(sendIntervalMs);
             }
             catch (Exception e)
             {
                 Debug.LogError($"Error sending audio data: {e.Message}");
-                mainThread.Post(_ => StopAll(), null);
-                break;
+                StopAll();
+                yield break;
             }
+
+            yield return wait;
         }
     }
 
     /// <summary>
     /// 接收音频数据
     /// </summary>
-    private void ReceiveAudioData()
+    private IEnumerator ReceiveAudioDataCoroutine()
     {
         byte[] buffer = new byte[bufferSize * sizeof(float)];
-    
+        WaitForSeconds shortWait = new WaitForSeconds(0.01f);
+
         while (isRunning && client?.Connected == true)
         {
             try
@@ -368,26 +343,24 @@ public class AudioClient : MonoBehaviour
                     if (bytesRead > 0)
                     {
                         float[] audioData = ConvertByteToFloat(buffer, bytesRead);
-                    
-                        // ConcurrentQueue是线程安全的，不需要额外的锁
+
                         while (audioDataQueue.Count >= MAX_QUEUE_SIZE)
                         {
                             audioDataQueue.TryDequeue(out _);
                         }
+
                         audioDataQueue.Enqueue(audioData);
                     }
-                }
-                else
-                {
-                    Thread.Sleep(10);
                 }
             }
             catch (Exception e)
             {
                 Debug.LogError($"Error receiving audio data: {e.Message}");
-                mainThread.Post(_ => StopAll(), null);
-                break;
+                StopAll();
+                yield break;
             }
+
+            yield return shortWait;
         }
     }
 
@@ -395,6 +368,7 @@ public class AudioClient : MonoBehaviour
     /// 当音频源需要读取数据时调用
     /// </summary>
     private readonly object fadeBufferLock = new object();
+
     private void OnAudioRead(float[] data)
     {
         lock (fadeBufferLock)
@@ -415,7 +389,7 @@ public class AudioClient : MonoBehaviour
         {
             int copyLength = Mathf.Min(data.Length, audioData.Length);
             Array.Copy(audioData, currentFadeBuffer, copyLength);
-            
+
             int fadeSamples = (int)(FADE_DURATION * sampleRate);
             for (int i = 0; i < copyLength; i++)
             {
