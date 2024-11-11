@@ -77,6 +77,8 @@ public class AudioClient : MonoBehaviour
     {
         try
         {
+            if (!isRunning) return; // 防止重复调用
+
             // 1. 停止所有操作
             isRunning = false;
             
@@ -119,7 +121,7 @@ public class AudioClient : MonoBehaviour
         try
         {
             // 给予线程一个合理的时间来完成当前操作
-            if (sendThread?.IsAlive == true)
+            if (sendThread != null && sendThread.IsAlive)
             {
                 if (!sendThread.Join(TimeSpan.FromSeconds(2)))
                 {
@@ -127,7 +129,7 @@ public class AudioClient : MonoBehaviour
                 }
             }
 
-            if (receiveThread?.IsAlive == true)
+            if (receiveThread != null && receiveThread.IsAlive)
             {
                 if (!receiveThread.Join(TimeSpan.FromSeconds(2)))
                 {
@@ -147,42 +149,50 @@ public class AudioClient : MonoBehaviour
         {
             try
             {
-                if (stream != null)
-                {
-                    // 1. 尝试发送任何缓冲的数据
-                    try
-                    {
-                        stream.Flush();
-                    }
-                    catch (Exception ex)
-                    {
-                        Debug.LogWarning($"Error flushing network stream: {ex.Message}");
-                    }
+                NetworkStream currentStream = stream;
+                TcpClient currentClient = client;
+                
+                stream = null;
+                client = null;
 
-                    // 2. 关闭网络流
-                    stream.Close();
-                    stream.Dispose();
-                    stream = null;
+                try
+                {
+                    currentStream?.Flush();
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning($"Error flushing stream: {ex.Message}");
+                }
+                
+                try
+                {
+                    currentStream?.Close();
+                    currentStream?.Dispose();
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning($"Error closing stream: {ex.Message}");
                 }
 
-                if (client != null)
+                try
                 {
-                    // 3. 关闭客户端连接
-                    if (client.Connected)
+                    if (currentClient?.Connected == true)
                     {
-                        client.Close();
+                        currentClient.Close();
                     }
-                    client.Dispose();
-                    client = null;
+                    currentClient?.Dispose();
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning($"Error closing client: {ex.Message}");
                 }
 
-                // 4. 清空音频数据队列
                 while (audioDataQueue.TryDequeue(out _)) { }
             }
-            catch (Exception ex)
+            finally
             {
-                Debug.LogError($"Error closing connection: {ex}");
-                throw; // 重新抛出异常以便上层处理
+                stream = null;
+                client = null;
             }
         }
     }
@@ -297,10 +307,9 @@ public class AudioClient : MonoBehaviour
     // 发送音频数据
     private void SendAudioData()
     {
-        // 每帧发送的样本数
         int samplesPerFrame = sampleRate * sendIntervalMs / 1000;
         float[] samples = new float[samplesPerFrame * channels];
-
+        
         while (isRunning && client?.Connected == true)
         {
             try
@@ -310,25 +319,32 @@ public class AudioClient : MonoBehaviour
                     var currentPosition = Microphone.GetPosition(null);
                     if (currentPosition < 0 || recordingClip == null) continue;
 
-                    // 确保连续读取
                     int readPosition = lastRecordPosition;
                     int samplesToRead = (currentPosition - lastRecordPosition + recordingClip.samples) 
                                         % recordingClip.samples;
 
-                    if (samplesToRead >= samples.Length)
+                    // 循环处理所有可用数据
+                    while (samplesToRead >= samples.Length && isRunning)
                     {
                         recordingClip.GetData(samples, readPosition);
                         byte[] bytes = ConvertFloatToByte(samples);
-                        stream?.Write(bytes, 0, bytes.Length);
                         
-                        lastRecordPosition = (readPosition + samples.Length) % recordingClip.samples;
+                        if (stream != null)
+                        {
+                            stream.Write(bytes, 0, bytes.Length);
+                            stream.Flush(); // 确保数据立即发送
+                        }
+                        
+                        readPosition = (readPosition + samples.Length) % recordingClip.samples;
+                        samplesToRead -= samples.Length;
+                        lastRecordPosition = readPosition;
                     }
                 }
                 Thread.Sleep(sendIntervalMs);
             }
             catch (Exception e)
             {
-                UpdateLog($"Error sending audio data: {e.Message}");
+                Debug.LogError($"Error sending audio data: {e.Message}");
                 mainThread.Post(_ => StopAll(), null);
                 break;
             }
@@ -341,35 +357,35 @@ public class AudioClient : MonoBehaviour
     private void ReceiveAudioData()
     {
         byte[] buffer = new byte[bufferSize * sizeof(float)];
-        
+    
         while (isRunning && client?.Connected == true)
         {
             try
             {
-                if (stream.DataAvailable)
+                if (stream?.CanRead == true && stream.DataAvailable)
                 {
                     int bytesRead = stream.Read(buffer, 0, buffer.Length);
                     if (bytesRead > 0)
                     {
                         float[] audioData = ConvertByteToFloat(buffer, bytesRead);
-                        
-                        // 如果队列太大，移除旧的数据
+                    
+                        // ConcurrentQueue是线程安全的，不需要额外的锁
                         while (audioDataQueue.Count >= MAX_QUEUE_SIZE)
                         {
                             audioDataQueue.TryDequeue(out _);
                         }
-                        
                         audioDataQueue.Enqueue(audioData);
                     }
                 }
                 else
                 {
-                    Thread.Sleep(10); // 避免过度占用CPU
+                    Thread.Sleep(10);
                 }
             }
             catch (Exception e)
             {
-                UpdateLog($"Error receiving audio data: {e.Message}");
+                Debug.LogError($"Error receiving audio data: {e.Message}");
+                mainThread.Post(_ => StopAll(), null);
                 break;
             }
         }
@@ -378,45 +394,50 @@ public class AudioClient : MonoBehaviour
     /// <summary>
     /// 当音频源需要读取数据时调用
     /// </summary>
+    private readonly object fadeBufferLock = new object();
     private void OnAudioRead(float[] data)
     {
-        if (fadeBuffer == null || fadeBuffer.Length != data.Length)
+        lock (fadeBufferLock)
         {
-            fadeBuffer = new float[data.Length];
+            if (fadeBuffer == null || fadeBuffer.Length != data.Length)
+            {
+                fadeBuffer = new float[data.Length];
+            }
+        }
+
+        float[] currentFadeBuffer;
+        lock (fadeBufferLock)
+        {
+            currentFadeBuffer = fadeBuffer;
         }
 
         if (audioDataQueue.TryDequeue(out float[] audioData))
         {
             int copyLength = Mathf.Min(data.Length, audioData.Length);
-            Array.Copy(audioData, fadeBuffer, copyLength);
+            Array.Copy(audioData, currentFadeBuffer, copyLength);
             
-            // 应用淡入淡出
             int fadeSamples = (int)(FADE_DURATION * sampleRate);
             for (int i = 0; i < copyLength; i++)
             {
-                if (i < fadeSamples)
-                {
-                    float fade = i / (float)fadeSamples;
-                    data[i] = fadeBuffer[i] * fade;
-                }
-                else
-                {
-                    data[i] = fadeBuffer[i];
-                }
+                float fade = i < fadeSamples ? i / (float)fadeSamples : 1f;
+                data[i] = currentFadeBuffer[i] * fade;
             }
         }
         else
         {
-            // 淡出现有音频
+            // 优化后的淡出处理
             int fadeSamples = (int)(FADE_DURATION * sampleRate);
-            for (int i = 0; i < data.Length && i < fadeSamples; i++)
+            for (int i = 0; i < data.Length; i++)
             {
-                float fade = 1 - (i / (float)fadeSamples);
-                data[i] = fadeBuffer[i] * fade;
-            }
-            if (fadeSamples < data.Length)
-            {
-                Array.Clear(data, fadeSamples, data.Length - fadeSamples);
+                if (i < fadeSamples)
+                {
+                    float fade = 1 - (i / (float)fadeSamples);
+                    data[i] = currentFadeBuffer[i] * fade;
+                }
+                else
+                {
+                    data[i] = 0f;
+                }
             }
         }
     }
@@ -453,41 +474,16 @@ public class AudioClient : MonoBehaviour
     private void OnApplicationQuit()
     {
         StopAll();
-        if (sendThread?.IsAlive == true)
-        {
-            sendThread.Join(TimeSpan.FromSeconds(1));
-        }
-        if (receiveThread?.IsAlive == true)
-        {
-            receiveThread.Join(TimeSpan.FromSeconds(1));
-        }
         CloseConnection();
     }
 
     private void OnDisable()
     {
-        // 确保在脚本被禁用时也能正确清理
         StopAll();
     }
 
     private void OnDestroy()
     {
-        // 确保在物体被销毁时也能正确清理
         StopAll();
-    }
-    
-    private void Dispose()
-    {
-        if (!isDisposed)
-        {
-            StopAll();
-            isDisposed = true;
-        }
-        GC.SuppressFinalize(this);
-    }
-
-    ~AudioClient()
-    {
-        Dispose();
     }
 }
